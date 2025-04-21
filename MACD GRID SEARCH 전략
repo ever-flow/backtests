@@ -1,0 +1,266 @@
+# 잘 맞는 종목을 찾기
+# 백테스팅 기간에 따라 weight
+
+!pip install bayesian-optimization
+!pip install yfinance
+
+import warnings
+warnings.filterwarnings('ignore', category=FutureWarning)
+warnings.filterwarnings('ignore', category=DeprecationWarning)
+
+import yfinance as yf
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from datetime import date, timedelta
+from bayes_opt import BayesianOptimization
+from IPython.display import display
+
+# 종목 리스트 정의 (주식과 코인 티커 추가)
+tickers = [
+    "ADA-USD", "DOGE-USD", "BTC-USD", "TSLA", "PLTR",
+    "SHIB-USD",  # 시바이누 코인 - 밈코인 대표
+    "AMC",       # AMC 엔터테인먼트 - 밈스탁 대표
+    "GME",       # 게임스톱 - 밈스탁 대표
+    "NVDA",       # 엔비디아 - AI/반도체 이슈로 변동성 확대
+]
+
+all_results = []
+
+# 백테스트 함수 (거래수수료 0.002 적용, 트레일링 스톱 추가)
+def backtest_strategy(price, signal, sma_filter=None, tc=0.002, initial_capital=1, trailing_stop_pct=0):
+    position = 0.0
+    cash = float(initial_capital)
+    equity_curve = np.zeros(len(price))
+    buy_points, sell_points = [], []
+    high_since_buy = 0.0  # 매수 이후 최고가
+
+    for i in range(len(price)):
+        if i == 0:
+            equity_curve[i] = cash
+            continue
+
+        # SMA 필터: 가격이 SMA 미만이면 매도
+        if sma_filter is not None and float(price.iloc[i]) < float(sma_filter.values[i]):
+            if position > 0:
+                proceeds = position * float(price.iloc[i])
+                cost = proceeds * tc
+                cash += proceeds - cost
+                position = 0.0
+                sell_points.append((price.index[i], float(price.iloc[i])))  # 가격 기록
+            equity_curve[i] = cash
+            continue
+
+        # 트레일링 스톱: 매수 이후 최고가 대비 일정 % 하락 시 매도
+        if position > 0 and trailing_stop_pct > 0:
+            if float(price.iloc[i]) > high_since_buy:
+                high_since_buy = float(price.iloc[i])
+            elif float(price.iloc[i]) < high_since_buy * (1 - trailing_stop_pct / 100):
+                proceeds = position * float(price.iloc[i])
+                cost = proceeds * tc
+                cash += proceeds - cost
+                position = 0.0
+                sell_points.append((price.index[i], float(price.iloc[i])))  # 가격 기록
+                equity_curve[i] = cash
+                continue
+
+        # 매수: 신호 1 발생 및 포지션이 없을 때
+        if signal.values[i] == 1 and position == 0:
+            cost = cash * tc
+            cash -= cost
+            position = cash / float(price.iloc[i])
+            cash = 0.0
+            high_since_buy = float(price.iloc[i])  # 매수 시점의 가격으로 초기화
+            buy_points.append((price.index[i], float(price.iloc[i])))  # 가격 기록
+        # 매도: 신호 -1 발생 및 포지션이 있을 때
+        elif signal.values[i] == -1 and position > 0:
+            proceeds = position * float(price.iloc[i])
+            cost = proceeds * tc
+            cash += proceeds - cost
+            position = 0.0
+            sell_points.append((price.index[i], float(price.iloc[i])))  # 가격 기록
+
+        equity_curve[i] = cash + position * float(price.iloc[i])
+
+    equity_curve = pd.Series(equity_curve, index=price.index)
+    daily_returns = equity_curve.pct_change().dropna()
+    period = (equity_curve.index[-1] - equity_curve.index[0]).days / 365.25
+    cagr = (equity_curve.iloc[-1] / initial_capital) ** (1/period) - 1 if period > 0 else 0
+    sharpe = (daily_returns.mean() / daily_returns.std()) * np.sqrt(252) if daily_returns.std() != 0 else 0
+    running_max = equity_curve.cummax()
+    drawdown = (equity_curve - running_max) / running_max
+    mdd = abs(drawdown.min())
+
+    return equity_curve, cagr, mdd, sharpe, period, position, cash, buy_points, sell_points
+
+# MACD 및 SIGNAL 선을 계산하는 함수
+def generate_filtered_macd_signals(data, short_span, long_span, signal_span):
+    ema_short = data['Close'].ewm(span=short_span, adjust=False).mean()
+    ema_long = data['Close'].ewm(span=long_span, adjust=False).mean()
+    macd = ema_short - ema_long
+    macd_signal = macd.ewm(span=signal_span, adjust=False).mean()
+
+    signal = np.zeros(len(data))
+    for i in range(1, len(data)):
+        if ema_short.values[i] > ema_long.values[i]:
+            if (macd.values[i] > macd_signal.values[i]) and (macd.values[i-1] <= macd_signal.values[i-1]):
+                signal[i] = 1
+            elif (macd.values[i] < macd_signal.values[i]) and (macd.values[i-1] >= macd_signal.values[i-1]):
+                signal[i] = -1
+    return pd.Series(signal, index=data.index)
+
+# Buy and Hold 전략 평가 함수
+def buy_and_hold(price, initial_capital=1, tc=0.002):
+    cash = initial_capital
+    cost = cash * tc
+    cash -= cost
+    position = cash / float(price.iloc[0])
+    cash = 0.0
+    equity_curve = [initial_capital]
+    for i in range(1, len(price)):
+        equity_curve.append(position * float(price.iloc[i]))
+    equity_curve = pd.Series(equity_curve, index=price.index)
+    daily_returns = equity_curve.pct_change().dropna()
+    period = (equity_curve.index[-1] - equity_curve.index[0]).days / 365.25
+    cagr = (equity_curve.iloc[-1] / initial_capital) ** (1/period) - 1 if period > 0 else 0
+    sharpe = (daily_returns.mean() / daily_returns.std()) * np.sqrt(252) if daily_returns.std() != 0 else 0
+    running_max = equity_curve.cummax()
+    drawdown = (equity_curve - running_max) / running_max
+    mdd = abs(drawdown.min())
+    return equity_curve, cagr, mdd, sharpe, period
+
+# 각 종목별로 최적화 및 평가 진행
+for ticker in tickers:
+    print(f"\n{ticker} 분석 중...")
+    today = date.today()
+    twenty_years_ago = today - timedelta(days=int(20 * 365.25))
+
+    # 데이터 다운로드 (20년치 데이터 시도, 없으면 최대 데이터)
+    df = yf.download(ticker, start=twenty_years_ago, end=today)
+    if df.empty:
+        print(f"{ticker}에 대한 20년 데이터가 없습니다. 가능한 모든 데이터를 다운로드합니다.")
+        df = yf.download(ticker, period="max")
+    df.sort_index(inplace=True)
+    df.rename(columns={'Volume': 'Vol.'}, inplace=True)
+
+    # 최근 3년 데이터 분리
+    three_years_ago = pd.Timestamp(today - timedelta(days=int(3 * 365.25)))
+    df_recent = df[df.index >= three_years_ago]
+
+    # Bayesian Optimization을 위한 목표 함수 정의
+    def objective(short_span, delta, signal_span, sma_window, trailing_stop_pct):
+        # 모든 파라미터를 5단위로 반올림
+        short_span = int(round(short_span / 5) * 5)
+        delta = int(round(delta / 5) * 5)
+        signal_span = int(round(signal_span / 5) * 5)
+        sma_window = int(round(sma_window / 5) * 5)
+        trailing_stop_pct = int(round(trailing_stop_pct / 5) * 5)
+
+        long_span = short_span + delta
+
+        # 제약조건 체크
+        if short_span >= long_span or sma_window < 5:
+            return -100  # 페널티 점수
+
+        sma_filter_overall = df['Close'].rolling(window=sma_window).mean()
+        signals_overall = generate_filtered_macd_signals(df, short_span, long_span, signal_span)
+        _, _, _, sharpe_overall, _, _, _, _, _ = backtest_strategy(
+            df['Close'], signals_overall, sma_filter=sma_filter_overall, tc=0.002, initial_capital=1, trailing_stop_pct=trailing_stop_pct
+        )
+
+        sma_filter_recent = df_recent['Close'].rolling(window=sma_window).mean()
+        signals_recent = generate_filtered_macd_signals(df_recent, short_span, long_span, signal_span)
+        _, _, _, sharpe_recent, _, _, _, _, _ = backtest_strategy(
+            df_recent['Close'], signals_recent, sma_filter=sma_filter_recent, tc=0.002, initial_capital=10000, trailing_stop_pct=trailing_stop_pct
+        )
+
+        avg_sharpe = (sharpe_overall + sharpe_recent) / 2.0
+        return avg_sharpe
+
+    # 다중 랜덤 시작(seed)을 통해 여러 번 최적화를 실행하고 최고 결과 선택
+    seeds = [1, 2, 3]
+    best_run = None
+    for seed in seeds:
+        optimizer = BayesianOptimization(
+            f=objective,
+            pbounds={
+                'short_span': (5, 55),
+                'delta': (5, 210),
+                'signal_span': (5, 35),
+                'sma_window': (50, 200),
+                'trailing_stop_pct': (0, 35)
+            },
+            random_state=seed,
+            verbose=2
+        )
+        # 초기 탐색 포인트와 반복 횟수를 늘려 최적화 진행
+        optimizer.maximize(init_points=10, n_iter=70)
+        if best_run is None or optimizer.max['target'] > best_run['target']:
+            best_run = optimizer.max
+
+    best_params = best_run['params']
+    best_short_span = int(round(best_params['short_span'] / 5) * 5)
+    best_delta = int(round(best_params['delta'] / 5) * 5)
+    best_signal_span = int(round(best_params['signal_span'] / 5) * 5)
+    best_sma_window = int(round(best_params['sma_window'] / 5) * 5)
+    best_trailing_stop_pct = int(round(best_params['trailing_stop_pct'] / 5) * 5)
+    best_long_span = best_short_span + best_delta
+
+    print(f"최적 파라미터: Short EMA = {best_short_span}, Long EMA = {best_long_span}, Signal EMA = {best_signal_span}, SMA Window = {best_sma_window}, Trailing Stop (%) = {best_trailing_stop_pct}")
+
+    # 전체 데이터에 대해 최적 전략 평가
+    sma_filter_best = df['Close'].rolling(window=best_sma_window).mean()
+    signals_best = generate_filtered_macd_signals(df, best_short_span, best_long_span, best_signal_span)
+    equity_curve, cagr, mdd, sharpe, period, final_position, final_cash, buy_points, sell_points = backtest_strategy(
+        df['Close'], signals_best, sma_filter=sma_filter_best, tc=0.002, initial_capital=1, trailing_stop_pct=best_trailing_stop_pct
+    )
+
+    # 최근 3년 데이터에 대해 평가
+    sma_filter_recent = df_recent['Close'].rolling(window=best_sma_window).mean()
+    signals_recent = generate_filtered_macd_signals(df_recent, best_short_span, best_long_span, best_signal_span)
+    _, cagr_recent, mdd_recent, sharpe_recent, period_recent, _, _, _, _ = backtest_strategy(
+        df_recent['Close'], signals_recent, sma_filter=sma_filter_recent, tc=0.002, initial_capital=10000, trailing_stop_pct=best_trailing_stop_pct
+    )
+
+    # Buy and Hold 전략 평가
+    equity_curve_bh, cagr_bh, mdd_bh, sharpe_bh, period_bh = buy_and_hold(df['Close'], initial_capital=1, tc=0.002)
+
+    all_results.append({
+        'Ticker': ticker,
+        'Short EMA': best_short_span,
+        'Long EMA': best_long_span,
+        'Signal EMA': best_signal_span,
+        'SMA Window': best_sma_window,
+        'Trailing Stop (%)': best_trailing_stop_pct,
+        'CAGR (%)_Overall': round(cagr * 100, 2),
+        'MDD (%)_Overall': round(mdd * 100, 2),
+        'Sharpe_Overall': round(sharpe, 2),
+        'CAGR (%)_Recent': round(cagr_recent * 100, 2),
+        'MDD (%)_Recent': round(mdd_recent * 100, 2),
+        'Sharpe_Recent': round(sharpe_recent, 2),
+        'Sharpe_Average': round((sharpe + sharpe_recent) / 2, 2),
+        'CAGR (%)_BuyHold': round(cagr_bh * 100, 2),
+        'MDD (%)_BuyHold': round(mdd_bh * 100, 2),
+        'Sharpe_BuyHold': round(sharpe_bh, 2),
+        'Data Period (Years)_Overall': round(period, 2)
+    })
+
+# 결과 DataFrame 생성
+all_results_df = pd.DataFrame(all_results)
+
+# 가중치 부여: Sharpe_Average에 Data Period (Years)_Overall을 곱하여 Weighted_Sharpe 생성
+all_results_df['Weighted_Sharpe'] = all_results_df['Sharpe_Average'] * all_results_df['Data Period (Years)_Overall']
+
+# Weighted_Sharpe를 기준으로 내림차순 정렬
+all_results_df = all_results_df.sort_values(by='Weighted_Sharpe', ascending=False).reset_index(drop=True)
+
+# 최종 결과 출력
+print("\n모든 종목의 최적 전략 (Weighted_Sharpe 기준 정렬):")
+display_columns = [
+    'Ticker', 'Short EMA', 'Long EMA', 'Signal EMA', 'SMA Window', 'Trailing Stop (%)',
+    'CAGR (%)_Overall', 'MDD (%)_Overall', 'Sharpe_Overall',
+    'CAGR (%)_Recent', 'MDD (%)_Recent', 'Sharpe_Recent', 'Sharpe_Average',
+    'CAGR (%)_BuyHold', 'MDD (%)_BuyHold', 'Sharpe_BuyHold',
+    'Data Period (Years)_Overall', 'Weighted_Sharpe'
+]
+display(all_results_df[display_columns])
