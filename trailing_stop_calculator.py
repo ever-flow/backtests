@@ -31,7 +31,7 @@ stop_price = latest_high * (1 - stop_percentage / 100)
 print(f"\n[{ticker}] {start_date} 이후 분석 결과:")
 print(f"최고가: {latest_high:.2f}")
 print(f"현재 종가: {latest_close:.2f}")
-print(f"고점 대비 하락률: {drop_pct:.2f}%")
+print(f"최고가 대비 하락률: {drop_pct:.2f}%")
 print(f"트레일링 스탑 가격: {stop_price:.2f}")
 print("포지션:", "!!! 매도 !!!" if drop_pct >= stop_percentage else "보유")
 
